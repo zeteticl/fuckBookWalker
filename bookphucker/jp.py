@@ -80,7 +80,7 @@ def webstore_ready(
             return True
         if "appleid.apple.com" in driver.current_url:
             return False
-        sleep(0.25)
+        sleep(0.4)
     return False
 
 
@@ -109,7 +109,7 @@ def auto_complete_webstore_login(
             if not apple_prompted:
                 print("Complete Apple sign-in in Chrome…", flush=True)
                 apple_prompted = True
-            sleep(1)
+            sleep(2)
             continue
 
         if validate_login(driver):
@@ -117,11 +117,11 @@ def auto_complete_webstore_login(
                 print("Opening book on webstore…", flush=True)
                 driver.get(store_url)
             dismiss_gdpr_banner(driver)
-            sleep(1)
+            sleep(2)
             continue
 
         driver.get(member_login_url)
-        sleep(2)
+        sleep(3)
 
     return False
 
@@ -278,6 +278,18 @@ def go2spread(driver: webdriver.Chrome, spread: int):
     go2page(driver, page_index+1)
 
 
+def wait_for_spread(
+    driver: webdriver.Chrome, spread: int, timeout: float
+) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with suppress(JavascriptException):
+            if get_current_spread(driver) == spread:
+                return True
+        sleep(0.15)
+    return False
+
+
 def download_book(driver: webdriver.Chrome, cfg: Config, book_uuid: str, overwrite):
     logging.info("Downloading book %s", book_uuid)
     cooperation_r = f"de{book_uuid}%2F"
@@ -343,28 +355,56 @@ def download_book(driver: webdriver.Chrome, cfg: Config, book_uuid: str, overwri
         if savename.exists() and not overwrite:
             logging.debug("page %s already exists, skipping", current_spread)
             continue
-        go2spread(driver, current_spread)
-        while get_current_spread(driver) != current_spread:
-            sleep(0.1)
-        sleep(.1)
-        wait4loading(driver)
-        logging.debug("Getting page %s out of %s", current_spread, total_spreads)
-        canvas = driver.find_element(By.CSS_SELECTOR, ".currentScreen canvas")
-        while retry < max_retries:
-            canvas_base64 = driver.execute_script(
-                "return arguments[0].toDataURL('image/png').slice(21);", canvas)
-            img_bytes = b64decode(canvas_base64)
-            img = Image.open(io.BytesIO(img_bytes))
-            if all(all(v == 0 for v in c) for c in img.getdata()):
-                logging.debug("Blank page %s, treated as unloaded page", current_spread)
-            elif img_bytes not in prev_imgs:
-                prev_imgs.append(img_bytes)
-                break
-            retry += 1
-            logging.debug("Retrying page %s (%s/%s)",
-                          current_spread, retry, max_retries)
-            sleep(0.3)
-        if retry == max_retries:
-            logging.warning("Potentially repeated page %s", current_spread)
-        img.save(savename)
-        logging.debug("Saved page %s", current_spread)
+        nav_timeout = max(120.0, cfg.loading_timeout_seconds * 2)
+        try:
+            go2spread(driver, current_spread)
+            if not wait_for_spread(driver, current_spread, nav_timeout):
+                logging.warning(
+                    "Spread %s navigation slow; retrying once", current_spread
+                )
+                go2spread(driver, current_spread)
+                if not wait_for_spread(driver, current_spread, nav_timeout):
+                    logging.error(
+                        "Skipping spread %s after navigation timeout; continuing book",
+                        current_spread,
+                    )
+                    continue
+            cfg.rate_limit_after_action()
+            wait4loading(driver, timeout=cfg.loading_timeout_seconds)
+            logging.debug("Getting page %s out of %s", current_spread, total_spreads)
+            canvas = driver.find_element(By.CSS_SELECTOR, ".currentScreen canvas")
+            img = None
+            while retry < max_retries:
+                canvas_base64 = driver.execute_script(
+                    "return arguments[0].toDataURL('image/png').slice(21);", canvas)
+                img_bytes = b64decode(canvas_base64)
+                img = Image.open(io.BytesIO(img_bytes))
+                if all(all(v == 0 for v in c) for c in img.getdata()):
+                    logging.debug(
+                        "Blank page %s, treated as unloaded page", current_spread
+                    )
+                elif img_bytes not in prev_imgs:
+                    prev_imgs.append(img_bytes)
+                    break
+                retry += 1
+                logging.debug(
+                    "Retrying page %s (%s/%s)", current_spread, retry, max_retries
+                )
+                cfg.rate_limit_retry_delay()
+            if retry == max_retries:
+                logging.warning("Potentially repeated page %s", current_spread)
+            if img is None:
+                logging.error(
+                    "No image for spread %s; skipping page", current_spread
+                )
+                continue
+            img.save(savename)
+            logging.debug("Saved page %s", current_spread)
+        except Exception as page_error:
+            logging.error(
+                "Failed spread %s (%s); continuing download",
+                current_spread,
+                page_error,
+            )
+            continue
+        cfg.rate_limit_after_page(current_spread)

@@ -170,26 +170,47 @@ def download_book(driver: webdriver.Chrome, cfg: Config, book_uuid: str, overwri
         if savename.exists() and not overwrite:
             logging.debug("Page %s already exists, skipping", current_page)
             continue
-        go2page(driver, menu_name, current_page)
-        while current_page != get_pages(driver)[0]:
-            sleep(0.1)
-        wait4loading(driver)
-        logging.debug("Getting page %s out of %s", current_page, total_pages)
-        canvas = driver.find_element(By.CSS_SELECTOR, ".currentScreen canvas")
-        while retry < max_retries:
-            canvas_base64 = driver.execute_script(
-                "return arguments[0].toDataURL('image/png').slice(21);", canvas)
-            img_bytes = b64decode(canvas_base64)
-            img = Image.open(io.BytesIO(img_bytes))
-            if all(all(v == 0 for v in c) for c in img.getdata()):
-                logging.debug("Blank page %s, treated as unloaded page", current_page)
-            elif img_bytes not in prev_imgs:
-                prev_imgs.append(img_bytes)
-                break
-            retry += 1
-            logging.debug("Retrying page %s (%s/%s)", current_page, retry, max_retries)
-            sleep(0.3)
-        if retry == max_retries:
-            logging.warning("Potentially repeated page %s", current_page)
-        img.save(savename)
-        logging.debug("Saved page %s", current_page)
+        try:
+            go2page(driver, menu_name, current_page)
+            nav_deadline = time.time() + max(120.0, cfg.loading_timeout_seconds * 2)
+            while current_page != get_pages(driver)[0]:
+                if time.time() > nav_deadline:
+                    logging.error(
+                        "Skipping page %s after navigation timeout; continuing book",
+                        current_page,
+                    )
+                    break
+                sleep(0.15)
+            else:
+                cfg.rate_limit_after_action()
+                wait4loading(driver)
+                logging.debug("Getting page %s out of %s", current_page, total_pages)
+                canvas = driver.find_element(By.CSS_SELECTOR, ".currentScreen canvas")
+                img = None
+                while retry < max_retries:
+                    canvas_base64 = driver.execute_script(
+                        "return arguments[0].toDataURL('image/png').slice(21);", canvas)
+                    img_bytes = b64decode(canvas_base64)
+                    img = Image.open(io.BytesIO(img_bytes))
+                    if all(all(v == 0 for v in c) for c in img.getdata()):
+                        logging.debug(
+                            "Blank page %s, treated as unloaded page", current_page
+                        )
+                    elif img_bytes not in prev_imgs:
+                        prev_imgs.append(img_bytes)
+                        break
+                    retry += 1
+                    logging.debug(
+                        "Retrying page %s (%s/%s)", current_page, retry, max_retries
+                    )
+                    cfg.rate_limit_retry_delay()
+                if retry == max_retries:
+                    logging.warning("Potentially repeated page %s", current_page)
+                if img is not None:
+                    img.save(savename)
+                    logging.debug("Saved page %s", current_page)
+                    cfg.rate_limit_after_page(current_page)
+        except Exception as page_error:
+            logging.error(
+                "Failed page %s (%s); continuing download", current_page, page_error
+            )

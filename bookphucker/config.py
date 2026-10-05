@@ -1,8 +1,10 @@
 from __future__ import annotations
-import undetected_chromedriver as uc
 import logging
+import random
+import undetected_chromedriver as uc
+from time import sleep
 from typing import Literal
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from semantic_version import Version
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.core.os_manager import ChromeType
@@ -24,6 +26,46 @@ class Config(BaseModel):
     logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     chrome_user_data_dir: str | None = None
     chrome_profile_directory: str | None = "Default"
+    rate_limit_page_delay_seconds: float = Field(default=1.2, ge=0)
+    rate_limit_jitter_seconds: float = Field(default=0.8, ge=0)
+    rate_limit_action_delay_seconds: float = Field(default=0.35, ge=0)
+    rate_limit_retry_delay_seconds: float = Field(default=0.6, ge=0)
+    rate_limit_batch_every_pages: int = Field(
+        default=20, ge=0, description="0 disables periodic long pauses"
+    )
+    rate_limit_batch_pause_seconds: float = Field(default=25.0, ge=0)
+    loading_timeout_seconds: int = Field(default=60, ge=5)
+
+    def rate_limit_after_page(self, page_index: int) -> None:
+        if (
+            self.rate_limit_batch_every_pages > 0
+            and page_index > 0
+            and page_index % self.rate_limit_batch_every_pages == 0
+        ):
+            print(
+                f"Rate limit: pausing {self.rate_limit_batch_pause_seconds:.0f}s "
+                f"after page {page_index} (download continues)…",
+                flush=True,
+            )
+            logging.info(
+                "Rate limit: resting %ss after page %s",
+                self.rate_limit_batch_pause_seconds,
+                page_index,
+            )
+            sleep(self.rate_limit_batch_pause_seconds)
+        sleep(
+            self.rate_limit_page_delay_seconds
+            + random.uniform(0, self.rate_limit_jitter_seconds)
+        )
+
+    def rate_limit_after_action(self) -> None:
+        sleep(self.rate_limit_action_delay_seconds)
+
+    def rate_limit_retry_delay(self) -> None:
+        sleep(
+            self.rate_limit_retry_delay_seconds
+            + random.uniform(0, self.rate_limit_jitter_seconds * 0.5)
+        )
 
     def get_webdriver(self):
         ua = self.user_agent or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"

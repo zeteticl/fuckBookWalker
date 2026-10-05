@@ -9,5 +9,12 @@
   "chrome_profile_directory": "Default",
   "viewer_size": [1440, 1440],
   "user_agent": null,
-  "logging_level": "INFO"
+  "logging_level": "INFO",
+  "rate_limit_page_delay_seconds": 1.2,
+  "rate_limit_jitter_seconds": 0.8,
+  "rate_limit_action_delay_seconds": 0.35,
+  "rate_limit_retry_delay_seconds": 0.6,
+  "rate_limit_batch_every_pages": 20,
+  "rate_limit_batch_pause_seconds": 25,
+  "loading_timeout_seconds": 60
 }

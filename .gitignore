@@ -1,12 +1,22 @@
+# --- bookphucker local / runtime (never commit) ---
+config.json
+babies/
+error.*
+exports/
+*.bak
 noupload
 workflow.*
 **/logs
-*.json
-*.bak
-exports/
 **/test.*
-babies/
-error.*
+
+# JSON: allow only the checked-in template (config has credentials)
+*.json
+!config.example.json
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

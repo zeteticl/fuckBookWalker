@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "browser": "chrome",
+  "headless": true,
+  "username": null,
+  "password": null,
+  "manual_login": false,
+  "chrome_user_data_dir": "C:/Users/You/AppData/Local/bookphucker-chrome-profile",
+  "chrome_profile_directory": "Default",
+  "viewer_size": [1440, 1440],
+  "user_agent": null,
+  "logging_level": "INFO"
+}

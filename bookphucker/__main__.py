@@ -4,7 +4,7 @@ import ujson as json
 import logging
 import requests
 from shutil import move, rmtree
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from getpass import getpass
 from pathlib import Path
 from contextlib import suppress
@@ -35,10 +35,20 @@ def main():
             if not book_page.startswith("http"):
                 book_page = "https://" + book_page
             book_url = urlparse(book_page)
-            if ".jp" in book_url.hostname:
+            if ".jp" in (book_url.hostname or ""):
                 if region == "auto":
                     region = "jp"
-                book_uuid = book_url.path
+                if book_url.hostname and book_url.hostname.startswith("viewer."):
+                    cid = parse_qs(book_url.query).get("cid", [None])[0]
+                    if not cid:
+                        raise ValueError(
+                            f"Could not find cid in viewer URL: {book_page}"
+                        )
+                    book_uuid = cid
+                else:
+                    book_uuid = book_url.path.strip("/")
+                    if book_uuid.startswith("de") and len(book_uuid) > 36:
+                        book_uuid = book_uuid[2:]
                 print(f"{book_uuid}")
             elif ".com.tw" in book_url.hostname:
                 if region == "auto":
@@ -56,7 +66,7 @@ def main():
         else:
             book_uuid = book_page
             print(f"{book_uuid}")
-        book_uuids.append(book_uuid.strip('/')[-36:])
+        book_uuids.append(str(book_uuid).strip("/")[-36:])
 
     match region:
         case "jp" | "auto":
@@ -110,9 +120,20 @@ def main():
                 driver.quit()
                 cfg.headless = False
                 driver = cfg.get_webdriver()
+        webstore_r = "top%2F"
+        if region in ("jp", "auto") and book_uuids:
+            webstore_r = f"de{book_uuids[0]}%2F"
         while True:
             try:
-                login(driver, username, password, error_on_captcha=cfg.headless)
+                login(
+                    driver,
+                    username,
+                    password,
+                    error_on_captcha=cfg.headless,
+                    preserve_browser_session=bool(cfg.chrome_user_data_dir),
+                    manual_login_mode=manual_login,
+                    webstore_cooperation_r=webstore_r,
+                )
             except RequiresCapcha:
                 print("Captcha required, but browser is headless.")
                 user_input = input(
@@ -122,7 +143,14 @@ def main():
                 driver.quit()
                 cfg.headless = False
                 driver = cfg.get_webdriver()
-                login(driver, username, password)
+                login(
+                    driver,
+                    username,
+                    password,
+                    preserve_browser_session=bool(cfg.chrome_user_data_dir),
+                    manual_login_mode=manual_login,
+                    webstore_cooperation_r=webstore_r,
+                )
 
             try:
                 for book_uuid in book_uuids:

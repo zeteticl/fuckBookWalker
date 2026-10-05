@@ -19,41 +19,159 @@ from PIL import Image
 from base64 import b64decode
 from collections import deque
 from .exc import RequiresCapcha
+from .commonvars import cookies_path
 from .utils import find_click, save_cookies, recover_cookies
 
 domain = "bookwalker.jp"
 
 
 def validate_login(driver: webdriver.Chrome) -> bool:
-    url = f"https://member.{domain}/app/03/my/profile"
-    driver.get(url)
-    with suppress(TimeoutException):
-        WebDriverWait(driver, 1).until(lambda x: "ES0001" in x.page_source)
-        return False
+    profile_url = f"https://member.{domain}/app/03/my/profile"
+    driver.get(profile_url)
     try:
-        WebDriverWait(driver, 2).until(EC.url_to_be(url))
-        return True
+        WebDriverWait(driver, 15).until(
+            lambda d: "/my/profile" in d.current_url
+            or "/app/03/login" in d.current_url
+        )
     except TimeoutException:
+        pass
+    current = driver.current_url
+    if "/app/03/login" in current:
         return False
+    if "ES0001" in driver.page_source:
+        return False
+    return "/my/profile" in current
 
 
-def login(driver: webdriver.Chrome, username: str, password: str, error_on_captcha=False):
+def cooperation_url(cooperation_r: str) -> str:
+    return (
+        f"https://member.{domain}/app/03/webstore/cooperation?r={cooperation_r}"
+    )
+
+
+def webstore_page_ok(driver: webdriver.Chrome) -> bool:
+    url = driver.current_url
+    if "appleid.apple.com" in url or "/app/03/login" in url:
+        return False
+    return bool(
+        driver.find_elements(By.CLASS_NAME, "t-c-product-main-data__title")
+        or driver.find_elements(By.CLASS_NAME, "t-c-read-button")
+    )
+
+
+def dismiss_gdpr_banner(driver: webdriver.Chrome) -> None:
+    with suppress(TimeoutException, NoSuchElementException):
+        WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "gdpr-accept"))
+        )
+        find_click(driver, By.CLASS_NAME, "gdpr-accept")
+
+
+def webstore_ready(
+    driver: webdriver.Chrome,
+    cooperation_r: str = "top%2F",
+    timeout: int = 15,
+) -> bool:
+    driver.get(cooperation_url(cooperation_r))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if webstore_page_ok(driver):
+            dismiss_gdpr_banner(driver)
+            return True
+        if "appleid.apple.com" in driver.current_url:
+            return False
+        sleep(0.25)
+    return False
+
+
+def auto_complete_webstore_login(
+    driver: webdriver.Chrome,
+    cooperation_r: str,
+    timeout: int = 600,
+) -> bool:
+    member_login_url = f"https://member.{domain}/app/03/login"
+    store_url = cooperation_url(cooperation_r)
+    driver.get(member_login_url)
+    print(
+        "Sign in in Chrome only if prompted; the script opens the book page automatically.",
+        flush=True,
+    )
+    deadline = time.time() + timeout
+    apple_prompted = False
+    while time.time() < deadline:
+        if webstore_page_ok(driver):
+            dismiss_gdpr_banner(driver)
+            print("Webstore session ready.", flush=True)
+            return True
+
+        url = driver.current_url
+        if "appleid.apple.com" in url:
+            if not apple_prompted:
+                print("Complete Apple sign-in in Chrome…", flush=True)
+                apple_prompted = True
+            sleep(1)
+            continue
+
+        if validate_login(driver):
+            if "cooperation" not in url or cooperation_r not in url:
+                print("Opening book on webstore…", flush=True)
+                driver.get(store_url)
+            dismiss_gdpr_banner(driver)
+            sleep(1)
+            continue
+
+        driver.get(member_login_url)
+        sleep(2)
+
+    return False
+
+
+def restore_session(
+    driver: webdriver.Chrome, cooperation_r: str = "top%2F"
+) -> bool:
+    logged_in = validate_login(driver)
+    if not logged_in and cookies_path.exists():
+        if recover_cookies(driver, f"https://{domain}/") and recover_cookies(
+            driver, f"https://member.{domain}/app/03/my/profile"
+        ):
+            logged_in = validate_login(driver)
+    if not logged_in:
+        return False
+    return webstore_ready(driver, cooperation_r)
+
+
+def login(
+    driver: webdriver.Chrome,
+    username: str,
+    password: str,
+    error_on_captcha=False,
+    preserve_browser_session=False,
+    manual_login_mode=False,
+    webstore_cooperation_r: str = "top%2F",
+):
     """
     Leave username and password empty for manual login
     """
-    if (recover_cookies(driver, f"https://{domain}/")
-        and recover_cookies(driver, f"https://member.{domain}/app/03/my/profile")
-            and validate_login(driver)):
-        logging.info("Recovered cookies")
-        return
-    driver.delete_all_cookies()
-    driver.get(f"https://{domain}/")
-    driver.execute_script("sendGa(1,'グローバルナビ','クリック','ヘッダログイン');")
-    driver.get(f"https://member.{domain}/app/03/webstore/cooperation?r=top%2F")
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.ID, "mailAddress")))
+    member_login_url = f"https://member.{domain}/app/03/login"
 
-    if username or password:
+    if restore_session(driver, webstore_cooperation_r):
+        print("Using saved BookWalker session (no login required).", flush=True)
+        logging.info("Using saved BookWalker session")
+        return
+
+    if not preserve_browser_session:
+        driver.delete_all_cookies()
+
+    if manual_login_mode:
+        if not auto_complete_webstore_login(driver, webstore_cooperation_r):
+            raise TimeoutException(
+                "Could not access BookWalker webstore within 10 minutes. "
+                "Finish member and Apple sign-in in Chrome, then retry."
+            )
+    elif username or password:
+        driver.get(f"https://member.{domain}/app/03/webstore/cooperation?r=top%2F")
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "mailAddress")))
         sleep(2)
         driver.find_element(By.ID, "mailAddress").send_keys(username)
         sleep(.2)
@@ -72,24 +190,21 @@ def login(driver: webdriver.Chrome, username: str, password: str, error_on_captc
                          "iframe[src^='https://www.recaptcha.net/recaptcha/api2/bframe']")))
                 if error_on_captcha:
                     raise RequiresCapcha()
-    else:
-        print("Manual login required")
-
-    init_time = time.time()
-    timeout = 10
-    with suppress(NoSuchElementException):
-        if driver.find_element(
-            By.CSS_SELECTOR,
-            "iframe[src^='https://www.recaptcha.net/recaptcha/api2/bframe']"
-        ).is_displayed():
-            timeout = 180
-    while True:
-        cookies = driver.get_cookies()
-        if any(c["name"] == "bwmember" for c in cookies):
-            break
-        if time.time() - init_time > timeout:
-            raise TimeoutException("Cookies retrieval timeout")
-        sleep(.1)
+        init_time = time.time()
+        timeout = 10
+        with suppress(NoSuchElementException):
+            if driver.find_element(
+                By.CSS_SELECTOR,
+                "iframe[src^='https://www.recaptcha.net/recaptcha/api2/bframe']"
+            ).is_displayed():
+                timeout = 180
+        while True:
+            cookies = driver.get_cookies() or []
+            if any(c.get("name") == "bwmember" for c in cookies):
+                break
+            if time.time() - init_time > timeout:
+                raise TimeoutException("Cookies retrieval timeout")
+            sleep(.1)
 
     save_cookies(driver, f"https://{domain}/")
     save_cookies(driver, f"https://member.{domain}/app/03/my/profile")
@@ -100,15 +215,30 @@ def logout(driver: webdriver.Chrome):
     find_click(driver, By.CLASS_NAME, "l-header__logout")
 
 
-def wait4loading(driver: webdriver.Chrome, timeout: int = 30):
-    # wait until all loading overlays have disappeared
-    WebDriverWait(driver, timeout).until_not(
-        lambda d: any(e.is_displayed()
-                      for e in d.find_elements(By.CLASS_NAME, "loading"))
+def _loading_overlay_visible(driver: webdriver.Chrome) -> bool:
+    return driver.execute_script(
+        """
+        return [...document.getElementsByClassName("loading")].some((el) => {
+            const s = getComputedStyle(el);
+            if (s.display === "none" || s.visibility === "hidden") {
+                return false;
+            }
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        });
+        """
     )
-    # Debug: print the CSS visibility for each loading element
-    print([e.get_attribute("style")
-          for e in driver.find_elements(By.CLASS_NAME, "loading")])
+
+
+def wait4loading(driver: webdriver.Chrome, timeout: int = 60):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: not _loading_overlay_visible(d)
+        )
+    except TimeoutException:
+        logging.warning(
+            "Loading overlay did not clear within %ss; continuing anyway", timeout
+        )
 
 
 def get_menu(driver: webdriver.Chrome) -> str:
@@ -150,10 +280,12 @@ def go2spread(driver: webdriver.Chrome, spread: int):
 
 def download_book(driver: webdriver.Chrome, cfg: Config, book_uuid: str, overwrite):
     logging.info("Downloading book %s", book_uuid)
-    driver.get(
-        f"https://member.{domain}/app/03/webstore/cooperation?r=de{book_uuid}%2F")
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.CLASS_NAME, "t-c-product-main-data__title")))
+    cooperation_r = f"de{book_uuid}%2F"
+    if not webstore_ready(driver, cooperation_r, timeout=30):
+        raise ValueError(
+            "BookWalker webstore session is not available. "
+            "Sign in again (including Apple ID if prompted) and retry."
+        )
 
     soup = bs4.BeautifulSoup(driver.page_source, "lxml")
 
@@ -168,11 +300,7 @@ def download_book(driver: webdriver.Chrome, cfg: Config, book_uuid: str, overwri
 
     driver.set_window_size(*cfg.viewer_size)
 
-    with suppress(TimeoutException):
-        WebDriverWait(driver, 3).until(EC.presence_of_element_located(
-            (By.CLASS_NAME, "gdpr-accept"))
-        )
-        find_click(driver, By.CLASS_NAME, "gdpr-accept")
+    dismiss_gdpr_banner(driver)
 
     WebDriverWait(driver, 10).until(
         EC.presence_of_element_located((By.CLASS_NAME, "t-c-read-button")))

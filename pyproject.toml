@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fuckBookWalker"
-version = "0.1.5"
+version = "0.2.0"
 description = "Download books from bookwalker.jp"
 authors = ["VermiIIi0n <dungeon.behind0t@icloud.com>"]
 readme = "README.md"
@@ -158,4 +158,4 @@ requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.scripts]
-bookbaker = "bookphucker.cli:run"
+bookphucker = "bookphucker.cli:run"

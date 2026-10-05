@@ -22,6 +22,8 @@ class Config(BaseModel):
     viewer_size: tuple[int, int] = (1440, 1440)
     user_agent: str | None = None
     logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    chrome_user_data_dir: str | None = None
+    chrome_profile_directory: str | None = "Default"
 
     def get_webdriver(self):
         ua = self.user_agent or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -37,6 +39,12 @@ class Config(BaseModel):
         if self.headless:
             # use new headless flag for modern Chrome
             options.add_argument("--headless=new")
+        if self.chrome_user_data_dir:
+            options.add_argument(f"--user-data-dir={self.chrome_user_data_dir}")
+            if self.chrome_profile_directory:
+                options.add_argument(
+                    f"--profile-directory={self.chrome_profile_directory}"
+                )
         # Initialize undetected_chromedriver with correct service
         driver = uc.Chrome(options=options, service=service)
         return driver

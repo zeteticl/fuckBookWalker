@@ -377,7 +377,7 @@ def wait4loading(driver: webdriver.Chrome, timeout: int = 60) -> bool:
 
 
 _NFBR_MENU_KEY_JS = (
-    "for (let k in NFBR.a6G.Initializer){"
+        "for (let k in NFBR.a6G.Initializer){"
     "if (NFBR.a6G.Initializer[k]['menu'] !== undefined){ return k; }}"
 )
 
@@ -454,15 +454,33 @@ def get_page_slider_counter(driver: webdriver.Chrome) -> tuple[int, int] | None:
     return None
 
 
-def _slider_book_page_lo(page_index: int) -> int:
-    """NFBR r8q.pageIndex → #pageSliderCounter leading page (all JP books)."""
+def _slider_book_page_lo(
+    page_index: int, next_page_index: int | None = None
+) -> int:
+    """
+    Map NFBR r8q.pageIndex to #pageSliderCounter (1-based book page).
+
+    Early spreads: counter ≈ pageIndex + 1. Later 見開き spreads (large pageIndex,
+    next entry +2): counter ≈ pageIndex + 2 (e.g. page_95 @ 189, page_96 @ 191).
+    """
     if page_index <= 1:
         return page_index + 1
-    return page_index
+    if (
+        next_page_index is not None
+        and next_page_index == page_index + 2
+        and page_index >= 100
+    ):
+        return page_index + 2
+    return page_index + 1
 
 
 def expected_book_page_for_spread(driver: webdriver.Chrome, spread: int) -> int:
-    return _slider_book_page_lo(get_spread_page_index(driver, spread))
+    pi = get_spread_page_index(driver, spread)
+    total = get_total_spreads(driver)
+    next_pi = (
+        get_spread_page_index(driver, spread + 1) if spread < total else None
+    )
+    return _slider_book_page_lo(pi, next_pi)
 
 
 def spread_slider_page_bounds(
@@ -470,10 +488,19 @@ def spread_slider_page_bounds(
 ) -> tuple[int, int]:
     """Inclusive #pageSliderCounter range for this spread (見開き, from r8q neighbors)."""
     pi = get_spread_page_index(driver, spread)
-    lo = _slider_book_page_lo(pi)
+    next_pi = (
+        get_spread_page_index(driver, spread + 1)
+        if spread < total_spreads
+        else None
+    )
+    lo = _slider_book_page_lo(pi, next_pi)
     if spread < total_spreads:
-        next_pi = get_spread_page_index(driver, spread + 1)
-        hi = _slider_book_page_lo(next_pi) - 1
+        next_next = (
+            get_spread_page_index(driver, spread + 2)
+            if spread + 1 < total_spreads
+            else None
+        )
+        hi = _slider_book_page_lo(next_pi, next_next) - 1
     else:
         hi = lo + 1
     return lo, max(lo, hi)
@@ -538,7 +565,7 @@ def ensure_spread_slider_position(
         current = slider[0]
         if lo <= current <= hi:
             return True
-        # Only moveToPage(lo) — never go2spread here (was causing 189↔191 oscillation).
+        # Only moveToPage — never go2spread here (was causing 189↔191 oscillation).
         if current == last_slider and current > hi:
             go2page(driver, hi)
         else:
@@ -555,10 +582,22 @@ def go2page(driver: webdriver.Chrome, page: int):
 
 
 def go2spread(driver: webdriver.Chrome, spread: int):
-    page_index = driver.execute_script(
-        f"return {get_menu(driver)}.model.attributes.a2u.r8q[{spread-1}].pageIndex"
+    total = get_total_spreads(driver)
+    page_index = int(
+        driver.execute_script(
+            f"return {get_menu(driver)}.model.attributes.a2u.r8q[{spread - 1}].pageIndex"
+        )
     )
-    go2page(driver, _slider_book_page_lo(int(page_index)))
+    next_pi = (
+        int(
+            driver.execute_script(
+                f"return {get_menu(driver)}.model.attributes.a2u.r8q[{spread}].pageIndex"
+            )
+        )
+        if spread < total
+        else None
+    )
+    go2page(driver, _slider_book_page_lo(page_index, next_pi))
 
 
 _FORCE_SPREAD_VIEW_JS = """
@@ -848,26 +887,91 @@ function canvasHasInk() {
   const canvases = Array.from(root.querySelectorAll("canvas")).filter(
     (c) => c.width > 2 && c.height > 2
   );
-  for (const c of canvases) {
-    const ctx = c.getContext("2d");
-    if (!ctx) continue;
-    const w = Math.min(96, c.width);
-    const h = Math.min(96, c.height);
-    const stepX = Math.max(1, Math.floor(w / 20));
-    const stepY = Math.max(1, Math.floor(h / 20));
-    const data = ctx.getImageData(0, 0, w, h).data;
-    for (let y = 0; y < h; y += stepY) {
-      for (let x = 0; x < w; x += stepX) {
-        const i = (y * w + x) * 4;
+  const inkAt = (data, sw, sh, stepX, stepY) => {
+    for (let y = 0; y < sh; y += stepY) {
+      for (let x = 0; x < sw; x += stepX) {
+        const i = (y * sw + x) * 4;
         if (data[i] < 228 || data[i + 1] < 228 || data[i + 2] < 228) {
           return true;
         }
       }
     }
+    return false;
+  };
+  for (const c of canvases) {
+    const ctx = c.getContext("2d");
+    if (!ctx) continue;
+    const cw = c.width;
+    const ch = c.height;
+    const patch = 96;
+    const anchors = [
+      [0, 0],
+      [Math.max(0, Math.floor(cw / 2) - patch / 2), 0],
+      [Math.max(0, cw - patch), 0],
+      [0, Math.max(0, Math.floor(ch / 2) - patch / 2)],
+      [Math.max(0, cw - patch), Math.max(0, ch - patch)],
+    ];
+    for (const [ax, ay] of anchors) {
+      const sw = Math.min(patch, cw - ax);
+      const sh = Math.min(patch, ch - ay);
+      if (sw < 2 || sh < 2) continue;
+      const stepX = Math.max(1, Math.floor(sw / 16));
+      const stepY = Math.max(1, Math.floor(sh / 16));
+      const data = ctx.getImageData(ax, ay, sw, sh).data;
+      if (inkAt(data, sw, sh, stepX, stepY)) return true;
+    }
   }
   return false;
 }
 return canvasHasInk();
+"""
+
+_CANVAS_IS_GRAY_LOADING_JS = """
+function canvasIsGrayLoading() {
+  const root = document.querySelector(".currentScreen");
+  if (!root) return false;
+  const canvases = Array.from(root.querySelectorAll("canvas")).filter(
+    (c) => c.width > 2 && c.height > 2
+  );
+  for (const c of canvases) {
+    const ctx = c.getContext("2d");
+    if (!ctx) continue;
+    const cw = c.width;
+    const ch = c.height;
+    const stepX = Math.max(1, Math.floor(cw / 32));
+    const stepY = Math.max(1, Math.floor(ch / 32));
+    let grayHits = 0;
+    let samples = 0;
+    let lumaSum = 0;
+    const data = ctx.getImageData(0, 0, cw, ch).data;
+    for (let y = 0; y < ch; y += stepY) {
+      for (let x = 0; x < cw; x += stepX) {
+        samples += 1;
+        const i = (y * cw + x) * 4;
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const luma = (r + g + b) / 3;
+        lumaSum += luma;
+        const spread = Math.max(r, g, b) - Math.min(r, g, b);
+        if (spread <= 20 && luma >= 95 && luma <= 178) {
+          grayHits += 1;
+        }
+      }
+    }
+    if (!samples) continue;
+    const grayFrac = grayHits / samples;
+    const meanLuma = lumaSum / samples;
+    if (grayFrac >= 0.45 && meanLuma >= 105 && meanLuma <= 188) {
+      return true;
+    }
+    if (grayFrac >= 0.38 && meanLuma >= 108 && meanLuma <= 185) {
+      return true;
+    }
+  }
+  return false;
+}
+return canvasIsGrayLoading();
 """
 
 _CANVAS_DIGEST_JS = """
@@ -963,35 +1067,131 @@ def _image_has_meaningful_content(
     return ink_hits >= max(4, samples // 80)
 
 
-def _spread_capture_looks_loading_placeholder(img: Image.Image) -> bool:
-    """BookWalker paints gray + white 'LOADING...' on canvas (not a DOM overlay only)."""
+def _image_has_any_ink_sample(
+    img: Image.Image, luma_threshold: int = 240
+) -> bool:
+    """Fine grid for sparse pages (colophon, ads) that coarse sampling misses."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    if w == 0 or h == 0:
+        return False
+    step = max(1, min(w, h) // 140)
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            r, g, b = rgb.getpixel((x, y))
+            if r < luma_threshold or g < luma_threshold or b < luma_threshold:
+                return True
+    return False
+
+
+def _spread_capture_luma_histogram(
+    img: Image.Image,
+) -> tuple[float, float, float]:
+    """Return (mid_tone_frac, bright_frac, mean_luma) from a coarse grid."""
     gray = img.convert("L")
     w, h = gray.size
     if w == 0 or h == 0:
-        return False
+        return 0.0, 0.0, 0.0
     step_x = max(1, w // 28)
     step_y = max(1, h // 28)
     mid_tone = 0
     bright = 0
+    luma_sum = 0
     samples = 0
     for y in range(0, h, step_y):
         for x in range(0, w, step_x):
             samples += 1
             p = gray.getpixel((x, y))
+            luma_sum += p
             if 55 <= p <= 190:
                 mid_tone += 1
             if p > 242:
                 bright += 1
     if samples == 0:
+        return 0.0, 0.0, 0.0
+    return mid_tone / samples, bright / samples, luma_sum / samples
+
+
+def _spread_capture_bookwalker_gray_field_frac(img: Image.Image) -> float:
+    """
+    Fraction of pixels that match BookWalker canvas LOADING gray (#707070–#b0b0b0,
+    near-neutral). White 'LOADING...' lettering does not count.
+    """
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    if w == 0 or h == 0:
+        return 0.0
+    step_x = max(1, w // 32)
+    step_y = max(1, h // 32)
+    hits = 0
+    samples = 0
+    for y in range(0, h, step_y):
+        for x in range(0, w, step_x):
+            samples += 1
+            r, g, b = rgb.getpixel((x, y))
+            luma = (r + g + b) / 3.0
+            if max(r, g, b) - min(r, g, b) > 20:
+                continue
+            if 95 <= luma <= 178:
+                hits += 1
+    if samples == 0:
+        return 0.0
+    return hits / samples
+
+
+def _spread_capture_still_on_gray_loading(img: Image.Image) -> bool:
+    """
+    BookWalker LOADING: full-spread flat gray with white 'LOADING...' on canvas
+    (see reader screenshot — not the white colophon page).
+
+    Colophon / normal pages are mostly paper-white or full artwork, not >45% flat
+    neutral gray.
+    """
+    mid_frac, bright_frac, mean_luma = _spread_capture_luma_histogram(img)
+    gray_field = _spread_capture_bookwalker_gray_field_frac(img)
+    if mid_frac == 0.0 and bright_frac == 0.0 and mean_luma == 0.0:
         return False
-    mid_frac = mid_tone / samples
-    bright_frac = bright / samples
-    return mid_frac > 0.5 and 0.008 < bright_frac < 0.22
+    # Primary: uniform BookWalker loading gray (works even with large LOADING text).
+    if gray_field >= 0.45 and 105 <= mean_luma <= 188:
+        return True
+    if mid_frac >= 0.52 and 108 <= mean_luma <= 185:
+        return True
+    # Gray field with a little white lettering (original heuristic).
+    if mid_frac > 0.5 and 0.008 < bright_frac < 0.22:
+        return True
+    # Almost all gray, little or no white — LOADING before text paints.
+    if mid_frac >= 0.38 and bright_frac < 0.28:
+        return True
+    # Uniform mid-gray wash (LOADING background ~#808080–#b0b0b0).
+    if 72 <= mean_luma <= 198 and mid_frac >= 0.30 and bright_frac < 0.35:
+        return True
+    return False
+
+
+def _spread_capture_looks_loading_placeholder(img: Image.Image) -> bool:
+    """Alias: gray canvas LOADING (not DOM overlay only)."""
+    return _spread_capture_still_on_gray_loading(img)
+
+
+def _spread_capture_looks_painted_page(img: Image.Image) -> bool:
+    """True when capture is a real page (manga, ads, colophon), not gray LOADING."""
+    if _spread_capture_still_on_gray_loading(img):
+        return False
+    if _image_has_meaningful_content(img):
+        return True
+    mid_frac, bright_frac, _mean = _spread_capture_luma_histogram(img)
+    # White / near-white page with sparse text (copyright, colophon).
+    if bright_frac >= 0.45 and _image_has_any_ink_sample(img):
+        return True
+    # Normal content: not dominated by LOADING gray.
+    if bright_frac >= 0.22 and mid_frac < 0.32:
+        return True
+    return False
 
 
 def _spread_capture_looks_unloaded(img: Image.Image) -> bool:
     """Unpainted canvas — not the gray LOADING placeholder (handled separately)."""
-    if _spread_capture_looks_loading_placeholder(img):
+    if _spread_capture_still_on_gray_loading(img):
         return True
     if _image_is_all_black(img):
         return True
@@ -1003,6 +1203,16 @@ def _viewer_canvas_has_ink(driver: webdriver.Chrome) -> bool:
     for _ in _each_browsing_context(driver):
         with suppress(JavascriptException, WebDriverException):
             if driver.execute_script(_CANVAS_HAS_INK_JS):
+                return True
+    _viewer_default_content(driver)
+    return False
+
+
+def _viewer_canvas_still_gray_loading(driver: webdriver.Chrome) -> bool:
+    _viewer_default_content(driver)
+    for _ in _each_browsing_context(driver):
+        with suppress(JavascriptException, WebDriverException):
+            if driver.execute_script(_CANVAS_IS_GRAY_LOADING_JS):
                 return True
     _viewer_default_content(driver)
     return False
@@ -1045,22 +1255,21 @@ def wait_for_spread_paint_ready(
                 last_renav = time.time()
             sleep(0.2)
             continue
-        if not _viewer_canvas_has_ink(driver):
-            sleep(0.35)
+        if _viewer_canvas_still_gray_loading(driver):
+            sleep(0.45)
             continue
         raw = _capture_spread_png_bytes(driver)
-        if raw is None:
-            sleep(0.25)
+        if raw is not None:
+            with suppress(OSError):
+                img = Image.open(io.BytesIO(raw))
+                if _spread_capture_still_on_gray_loading(img):
+                    sleep(0.4)
+                    continue
+                if _spread_capture_looks_painted_page(img):
+                    return True
+        elif not _viewer_canvas_has_ink(driver):
+            sleep(0.35)
             continue
-        with suppress(OSError):
-            img = Image.open(io.BytesIO(raw))
-            if _spread_capture_looks_loading_placeholder(img):
-                sleep(0.4)
-                continue
-            if _image_has_meaningful_content(img):
-                return True
-            if not _image_is_all_black(img):
-                return True
         sleep(0.25)
     return False
 
@@ -1608,7 +1817,7 @@ def download_book(
             _ensure_nfbr_context(driver)
             sleep(0.5)
     else:
-        raise TimeoutException("Total spreads retrieval timeout")
+                raise TimeoutException("Total spreads retrieval timeout")
     step(f"Spreads: {total_spreads} (capture unit = spread, not single book page)")
     meta_path.write_text(
         json.dumps(
@@ -1854,7 +2063,9 @@ def download_book(
                         current_spread,
                         min(25.0, canvas_timeout + 8.0),
                     )
-                elif _spread_capture_looks_unloaded(img):
+                elif _spread_capture_looks_unloaded(img) and not _image_has_any_ink_sample(
+                    img
+                ):
                     last_reject_reason = "capture has no ink (unpainted canvas)"
                     logging.debug(
                         "Spread %s capture looks unpainted, re-navigating",
@@ -1921,7 +2132,10 @@ def download_book(
                     and img_bytes is not None
                     and viewer_position_matches_spread(driver, current_spread)
                     and not _spread_capture_looks_loading_placeholder(img)
-                    and _image_has_meaningful_content(img)
+                    and (
+                        _image_has_meaningful_content(img)
+                        or _image_has_any_ink_sample(img)
+                    )
                 ):
                     prev_bytes = _previous_spread_png_bytes(
                         save_dir, manifest, current_spread

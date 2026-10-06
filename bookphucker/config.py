@@ -28,10 +28,10 @@ class Config(BaseModel):
     chrome_profile_directory: str | None = "Default"
     chrome_start_minimized: bool = False
     rate_limit_page_delay_seconds: float = Field(
-        default=2.2, ge=0, description="Base delay after each saved page (~reading flip)"
+        default=0.5, ge=0, description="Base delay after each saved page (~reading flip)"
     )
     rate_limit_jitter_seconds: float = Field(
-        default=1.3, ge=0, description="Random extra seconds added per page"
+        default=1.0, ge=0, description="Random extra seconds added per page"
     )
     rate_limit_action_delay_seconds: float = Field(default=0.35, ge=0)
     rate_limit_retry_delay_seconds: float = Field(default=0.6, ge=0)

@@ -1,2 +1,7 @@
-def run():
-    from .__main__ import main as _
+import sys
+
+
+def run() -> None:
+    from .__main__ import main
+
+    raise SystemExit(main())

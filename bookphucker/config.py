@@ -26,14 +26,23 @@ class Config(BaseModel):
     logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     chrome_user_data_dir: str | None = None
     chrome_profile_directory: str | None = "Default"
-    rate_limit_page_delay_seconds: float = Field(default=1.2, ge=0)
-    rate_limit_jitter_seconds: float = Field(default=0.8, ge=0)
+    chrome_start_minimized: bool = False
+    rate_limit_page_delay_seconds: float = Field(
+        default=2.2, ge=0, description="Base delay after each saved page (~reading flip)"
+    )
+    rate_limit_jitter_seconds: float = Field(
+        default=1.3, ge=0, description="Random extra seconds added per page"
+    )
     rate_limit_action_delay_seconds: float = Field(default=0.35, ge=0)
     rate_limit_retry_delay_seconds: float = Field(default=0.6, ge=0)
     rate_limit_batch_every_pages: int = Field(
-        default=20, ge=0, description="0 disables periodic long pauses"
+        default=0,
+        ge=0,
+        description="Every N pages, pause batch_pause_seconds; 0 = off (steady pace only)",
     )
-    rate_limit_batch_pause_seconds: float = Field(default=25.0, ge=0)
+    rate_limit_batch_pause_seconds: float = Field(
+        default=5.0, ge=0, description="Long pause when batch_every_pages triggers"
+    )
     loading_timeout_seconds: int = Field(default=60, ge=5)
 
     def rate_limit_after_page(self, page_index: int) -> None:
@@ -42,15 +51,15 @@ class Config(BaseModel):
             and page_index > 0
             and page_index % self.rate_limit_batch_every_pages == 0
         ):
-            print(
-                f"Rate limit: pausing {self.rate_limit_batch_pause_seconds:.0f}s "
-                f"after page {page_index} (download continues)…",
-                flush=True,
-            )
             logging.info(
-                "Rate limit: resting %ss after page %s",
+                "Rate limit: pausing %ss after page %s",
                 self.rate_limit_batch_pause_seconds,
                 page_index,
+            )
+            print(
+                f"  · Rate limit: pausing {self.rate_limit_batch_pause_seconds:.0f}s "
+                f"after page {page_index} (download continues)…",
+                flush=True,
             )
             sleep(self.rate_limit_batch_pause_seconds)
         sleep(
@@ -74,6 +83,7 @@ class Config(BaseModel):
         options.add_argument("--high-dpi-support=1")
         options.add_argument(f"--user-agent={ua}")
         options.add_argument(f"--window-size={self.viewer_size[0]},{self.viewer_size[1]}")
+        options.add_argument("--disable-popup-blocking")
         chrome_type = ChromeType.CHROMIUM if self.browser == "chromium" else ChromeType.GOOGLE
         # Install matching ChromeDriver and create a Service
         service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
@@ -81,6 +91,8 @@ class Config(BaseModel):
         if self.headless:
             # use new headless flag for modern Chrome
             options.add_argument("--headless=new")
+        elif self.chrome_start_minimized:
+            options.add_argument("--start-minimized")
         if self.chrome_user_data_dir:
             options.add_argument(f"--user-data-dir={self.chrome_user_data_dir}")
             if self.chrome_profile_directory:

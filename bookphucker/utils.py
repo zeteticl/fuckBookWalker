@@ -1,6 +1,8 @@
 import ujson as json
+from contextlib import suppress
 from typing import Any
 from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
 from urllib.parse import urlparse
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support.ui import WebDriverWait
@@ -37,10 +39,19 @@ def save_cookies(driver: webdriver.Chrome, url: str):
 
 def scroll_click(driver: webdriver.Chrome, element: WebElement, timeout: int = 10):
     WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(element))
-    webdriver.ActionChains(driver).scroll_to_element(element).perform()
-    element.click()  # sending click event to element instead of clicking on element position with action chains
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});"
+            "arguments[0].click();",
+            element,
+        )
+    except WebDriverException:
+        with suppress(WebDriverException):
+            element.click()
 
 
 def find_click(driver: webdriver.Chrome, by: str, value: str, timeout: int = 10):
-    element = driver.find_element(by, value)
+    element = WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((by, value))
+    )
     scroll_click(driver, element, timeout)

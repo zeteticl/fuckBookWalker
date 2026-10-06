@@ -898,6 +898,16 @@ def download_book(
     else:
         step(f"Saving {total_spreads} pages to babies/{title}")
 
+    if (
+        not overwrite
+        and existing_pages >= total_spreads
+        and (save_dir / f"page_{total_spreads}.png").exists()
+    ):
+        step(f"All {total_spreads} pages on disk — skipping capture")
+        _leave_viewer_after_download(driver, book_uuid)
+        done(f"Finished — {total_spreads}/{total_spreads} pages in babies/{title}")
+        return
+
     go2spread(driver, 1)
     sleep(2)
 

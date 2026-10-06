@@ -20,6 +20,14 @@ from bookphucker.jp_book_id import jp_cooperation_r, normalize_jp_book_uuid
 from bookphucker.user_log import done, headline, step, warn
 
 
+def _quit_driver(driver) -> None:
+    with suppress(WebDriverException, OSError):
+        driver.quit()
+    # uc.Chrome.__del__ calls quit() again; noop avoids WinError 6 on Windows
+    with suppress(Exception):
+        driver.quit = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+
 def _browser_dead(exc: BaseException) -> bool:
     if isinstance(exc, (NoSuchWindowException, InvalidSessionIdException)):
         return True
@@ -239,8 +247,8 @@ def main():
         print("Exiting...")
         exit_code = 130
     finally:
-        with suppress(WebDriverException, OSError):
-            driver.quit()
+        with suppress(NameError):
+            _quit_driver(driver)
 
     return exit_code
 

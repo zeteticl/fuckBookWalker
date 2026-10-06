@@ -73,6 +73,17 @@ def main():
         metavar="PATH",
         help="Audit page_*.png and manifest.json in a babies folder (no download)",
     )
+    parser.add_argument(
+        "--incomplete-retries",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Re-run unfinished books N more times after the first pass "
+            "(default from config: incomplete_extra_passes, usually 3 → 4 passes total). "
+            "Use 0 for a single pass only."
+        ),
+    )
 
     args = parser.parse_args()
     if args.verify_dir is not None:
@@ -165,6 +176,14 @@ def main():
         print(f"Cache directory cleared at {cache_path}")
 
     cfg.config_logging()
+    incomplete_extra = (
+        args.incomplete_retries
+        if args.incomplete_retries is not None
+        else cfg.incomplete_extra_passes
+    )
+    if incomplete_extra < 0:
+        parser.error("--incomplete-retries must be >= 0")
+    max_download_passes = 1 + incomplete_extra
     headless = cfg.effective_headless()
     if cfg.headless and cfg.chrome_user_data_dir and not headless:
         step(
@@ -250,67 +269,138 @@ def main():
             if not book_uuids:
                 raise ValueError("No books to download.")
 
+            if max_download_passes > 1:
+                step(
+                    f"Incomplete auto-retry: up to {max_download_passes} pass(es) "
+                    f"(1 initial + {incomplete_extra} retry)"
+                )
+
             retry_after_error998 = False
-            total_books = len(book_uuids)
-            books_ok: list[str] = []
-            books_failed: list[tuple[str, str]] = []
-            for book_index, book_uuid in enumerate(book_uuids, start=1):
-                try:
-                    download_book(
-                        driver,
-                        cfg,
-                        book_uuid,
-                        overwrite=args.overwrite,
-                        book_index=book_index,
-                        book_total=total_books,
+            pass_queue: list[str] = list(book_uuids)
+            all_books_ok: set[str] = set()
+            final_failed: list[tuple[str, str]] = []
+            pass_num = 0
+
+            while pass_queue and pass_num < max_download_passes:
+                pass_num += 1
+                if pass_num > 1:
+                    headline(
+                        f"Incomplete retry pass {pass_num - 1}/{incomplete_extra} "
+                        f"— {len(pass_queue)} book(s)"
                     )
-                    books_ok.append(book_uuid)
-                except TimeoutException as timeout_err:
-                    if "ERROR998" in driver.page_source:
-                        logging.error("Error 998: Must log out from another device")
-                        login_retry += 1
-                        if login_retry > max_login_retries:
-                            raise
-                        logging.warning(
-                            "Retrying login %s/%s", login_retry, max_login_retries
+                    for uid in pass_queue:
+                        step(uid)
+
+                total_books = len(pass_queue)
+                books_ok: list[str] = []
+                books_failed: list[tuple[str, str]] = []
+                incomplete_uuids: list[str] = []
+                for book_index, book_uuid in enumerate(pass_queue, start=1):
+                    try:
+                        download_book(
+                            driver,
+                            cfg,
+                            book_uuid,
+                            overwrite=args.overwrite,
+                            book_index=book_index,
+                            book_total=total_books,
                         )
-                        logout(driver)
-                        retry_after_error998 = True
-                        break
-                    books_failed.append((book_uuid, str(timeout_err)))
-                    warn(
-                        f"Timed out on {book_uuid} ({timeout_err}); "
-                        "continuing with next book"
-                    )
-                except JpDownloadIncomplete as incomplete:
-                    books_failed.append((book_uuid, str(incomplete)))
-                    warn(str(incomplete))
-                except Exception as book_error:
-                    if _browser_dead(book_error):
-                        logging.error(
-                            "Chrome window closed or session lost; stopping batch."
-                        )
+                        books_ok.append(book_uuid)
+                        all_books_ok.add(book_uuid)
+                    except TimeoutException as timeout_err:
+                        if "ERROR998" in driver.page_source:
+                            logging.error(
+                                "Error 998: Must log out from another device"
+                            )
+                            login_retry += 1
+                            if login_retry > max_login_retries:
+                                raise
+                            logging.warning(
+                                "Retrying login %s/%s",
+                                login_retry,
+                                max_login_retries,
+                            )
+                            logout(driver)
+                            retry_after_error998 = True
+                            break
+                        books_failed.append((book_uuid, str(timeout_err)))
+                        incomplete_uuids.append(book_uuid)
                         warn(
-                            "Browser closed or crashed — re-run bookphucker "
-                            "(existing page_*.png files are skipped)"
+                            f"Timed out on {book_uuid} ({timeout_err}); "
+                            "continuing with next book"
                         )
-                        raise
-                    books_failed.append((book_uuid, str(book_error)))
-                    warn(
-                        f"Failed {book_uuid} ({book_error}); continuing with next book"
+                    except JpDownloadIncomplete as incomplete:
+                        books_failed.append((book_uuid, str(incomplete)))
+                        incomplete_uuids.append(book_uuid)
+                        warn(str(incomplete))
+                    except Exception as book_error:
+                        if _browser_dead(book_error):
+                            logging.error(
+                                "Chrome window closed or session lost; stopping batch."
+                            )
+                            warn(
+                                "Browser closed or crashed — re-run bookphucker "
+                                "(existing page_*.png files are skipped)"
+                            )
+                            raise
+                        books_failed.append((book_uuid, str(book_error)))
+                        warn(
+                            f"Failed {book_uuid} ({book_error}); "
+                            "continuing with next book"
+                        )
+
+                if retry_after_error998:
+                    break
+
+                final_failed = books_failed
+                if not books_failed:
+                    done(
+                        f"Batch complete — {len(all_books_ok)} book(s) OK "
+                        f"(pass {pass_num}/{max_download_passes})"
                     )
+                    pass_queue = []
+                    break
+
+                if pass_num < max_download_passes:
+                    if incomplete_uuids:
+                        pass_queue = list(dict.fromkeys(incomplete_uuids))
+                        other_failed = len(books_failed) - len(pass_queue)
+                        extra = (
+                            f", {other_failed} hard failure(s) not retried"
+                            if other_failed > 0
+                            else ""
+                        )
+                    else:
+                        pass_queue = [uid for uid, _ in books_failed]
+                        extra = ""
+                    if not pass_queue:
+                        pass_queue = []
+                        warn(
+                            f"Pass {pass_num}/{max_download_passes}: "
+                            f"no retryable books left ({len(books_failed)} hard failure(s))"
+                        )
+                        exit_code = 1
+                        for uid, err in books_failed:
+                            step(f"FAILED {uid}: {err[:120]}")
+                        break
+                    warn(
+                        f"Pass {pass_num}/{max_download_passes}: "
+                        f"{len(all_books_ok)} book(s) complete overall, "
+                        f"{len(pass_queue)} to retry{extra}"
+                    )
+                else:
+                    pass_queue = []
+                    exit_code = 1
+                    warn(
+                        f"After {max_download_passes} pass(es): "
+                        f"{len(all_books_ok)} book(s) complete, "
+                        f"{len(books_failed)} still incomplete"
+                    )
+                    for uid, err in books_failed:
+                        step(f"FAILED {uid}: {err[:120]}")
+
             if retry_after_error998:
                 continue
-            if books_failed:
-                exit_code = 1
-                warn(
-                    f"Batch finished: {len(books_ok)} succeeded, "
-                    f"{len(books_failed)} failed"
-                )
-                for uid, err in books_failed:
-                    step(f"FAILED {uid}: {err[:120]}")
-            elif books_ok:
-                done(f"Batch complete — {len(books_ok)} book(s) OK")
             break
     except Exception as e:
         with suppress(WebDriverException):

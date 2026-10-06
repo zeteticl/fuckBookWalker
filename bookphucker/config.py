@@ -60,6 +60,19 @@ class Config(BaseModel):
             "(recommended on Windows)"
         ),
     )
+    incomplete_extra_passes: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "After the first queue pass, re-download books still incomplete "
+            "this many extra times (total passes = 1 + this value)"
+        ),
+    )
+    jp_spread_capture_max_retries: int = Field(
+        default=18,
+        ge=4,
+        description="Per-spread capture validation retries (all JP books)",
+    )
     jp_force_spread_view: bool = Field(
         default=True,
         description=(

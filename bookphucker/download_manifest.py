@@ -233,6 +233,42 @@ def reconcile_manifest_hashes_from_disk(
     return updated
 
 
+def adopt_orphan_disk_spreads(
+    manifest: BookManifest, save_dir: Path, total_spreads: int
+) -> int:
+    """Promote page_N.png on disk into manifest when manifest was not flushed (e.g. crash)."""
+    import io
+
+    from PIL import Image
+
+    adopted = 0
+    for spread in range(1, total_spreads + 1):
+        if spread_verified_on_disk(manifest, spread, save_dir):
+            continue
+        path = save_dir / f"page_{spread}.png"
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if len(data) < 500:
+            continue
+        if find_verified_spread_with_hash(manifest, spread, sha256_bytes(data)) is not None:
+            continue
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                w, h = im.size
+        except OSError:
+            continue
+        rec = manifest.spreads.get(spread)
+        page_index = rec.page_index if rec and rec.page_index is not None else 0
+        dup = mark_spread_verified(manifest, spread, data, w, h, page_index)
+        if dup is None:
+            adopted += 1
+    return adopted
+
+
 def spread_resume_skippable(
     manifest: BookManifest | None, spread: int, save_dir: Path
 ) -> bool:

@@ -8,6 +8,7 @@
   "chrome_user_data_dir": "C:/Users/You/AppData/Local/bookphucker-chrome-profile",
   "chrome_profile_directory": "Default",
   "chrome_start_minimized": false,
+  "chrome_headless_with_profile": false,
   "viewer_size": [1440, 1440],
   "user_agent": null,
   "logging_level": "INFO",
@@ -17,5 +18,6 @@
   "rate_limit_retry_delay_seconds": 0.6,
   "rate_limit_batch_every_pages": 0,
   "rate_limit_batch_pause_seconds": 5,
-  "loading_timeout_seconds": 60
+  "loading_timeout_seconds": 60,
+  "jp_force_spread_view": true
 }

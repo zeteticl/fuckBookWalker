@@ -1,0 +1,17 @@
+# Batch queue — one BookWalker JP product per line (UUID or /de…/ URL)
+# スーサイドガール 10
+https://bookwalker.jp/dec04c0b91-87c2-4066-b60b-15bcc465853a/
+# 天空の扉 23
+https://bookwalker.jp/de2f1afe1f-11a5-4d93-acfe-eea2c02e3869/
+# ドラゴンクエスト列伝 ロトの紋章 Returns
+https://bookwalker.jp/def053e99e-da33-4b8c-99f6-4658d33b06e9/
+# ドラゴンクエスト列伝 ロトの紋章～紋章を継ぐ者達へ～1巻
+https://bookwalker.jp/de5d50a4c7-07d8-4e8f-b6fd-d4ee5a88c762/
+# 天空の扉 19
+https://bookwalker.jp/de0ec57268-ae92-453a-a0bf-8a4026bda003/
+# 天空の扉 20
+https://bookwalker.jp/ded73b565f-3959-4636-bf1b-d9330c4f0a01/
+# 天空の扉 21
+https://bookwalker.jp/dec4d19a4d-27e4-4743-bb89-7a1149bf5aaf/
+# 天空の扉 22
+https://bookwalker.jp/deb187479d-4c3c-463d-834b-6b8d689fb4fd/

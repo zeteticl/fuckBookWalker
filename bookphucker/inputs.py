@@ -150,6 +150,11 @@ def parse_cli_inputs(
             "Detected '&' with settleUuid — also scanning joined arguments for "
             "purchase receipts (use purchase:SETTLE_UUID to avoid .cmd issues)."
         )
+    elif "&" in blob and "bookwalker" in blob.lower():
+        inputs.warnings.append(
+            "Detected '&' near a BookWalker URL — cmd.exe may have split arguments. "
+            "Use -f books.txt, PowerShell, or UUIDs only."
+        )
 
     seen_tokens: set[str] = set()
     for settle in _SETTLE_IN_TEXT_RE.findall(blob):

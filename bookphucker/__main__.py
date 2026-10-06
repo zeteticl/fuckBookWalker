@@ -13,7 +13,7 @@ from selenium.common.exceptions import (
     InvalidSessionIdException,
 )
 from bookphucker import Config
-from bookphucker.exc import RequiresCapcha
+from bookphucker.exc import JpDownloadIncomplete, RequiresCapcha
 from bookphucker.commonvars import config_path, cache_path
 from bookphucker.inputs import parse_cli_inputs
 from bookphucker.jp_book_id import jp_cooperation_r, normalize_jp_book_uuid
@@ -47,22 +47,76 @@ def main():
             "purchase:SETTLE_UUID instead of a URL containing '&'."
         ),
     )
-    parser.add_argument("book_pages", help="The page url or book uuid", nargs='+')
+    parser.add_argument(
+        "book_pages",
+        help="Book URL or UUID (quote URLs in cmd.exe; or use -f)",
+        nargs="*",
+        default=[],
+    )
+    parser.add_argument(
+        "-f",
+        "--from-file",
+        action="append",
+        type=Path,
+        metavar="PATH",
+        help="Text file: one URL/UUID per line (avoids Windows '&' in cmd)",
+    )
     parser.add_argument("-r", "--region", help="The region of the bookwalker site",
                         default="auto", choices=["jp", "tw", "auto"])
     parser.add_argument("--no-cache", help="Clear cache directory (cookies, etc.)",
                         action="store_true")
     parser.add_argument("--overwrite", help="Overwrite existing files",
                         action="store_true")
+    parser.add_argument(
+        "--verify-dir",
+        type=Path,
+        metavar="PATH",
+        help="Audit page_*.png and manifest.json in a babies folder (no download)",
+    )
 
     args = parser.parse_args()
-    parsed = parse_cli_inputs(args.book_pages, region=args.region)
+    if args.verify_dir is not None:
+        from bookphucker.verify_local import audit_book_folder
+
+        raise SystemExit(audit_book_folder(args.verify_dir.resolve()))
+    raw_inputs: list[str] = list(args.book_pages)
+    for list_path in args.from_file or []:
+        if not list_path.is_file():
+            parser.error(f"List file not found: {list_path}")
+        for line in list_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                raw_inputs.append(line)
+    if not raw_inputs:
+        parser.error("No books given. Pass URLs/UUIDs or use -f books.txt")
+
+    cmd_line = " ".join(sys.argv)
+    if "&" in cmd_line and "bookwalker" in cmd_line.lower():
+        warn(
+            "Command line contains '&' — cmd.exe may have broken your URLs. "
+            "Use PowerShell, quote every URL, strip ?query from links, "
+            "use bare UUIDs, or put links in a file: -f books.txt"
+        )
+
+    parsed = parse_cli_inputs(raw_inputs, region=args.region)
+    for note in parsed.warnings:
+        warn(note)
     book_uuids = parsed.book_uuids
     purchase_resolve_urls = parsed.purchase_urls
     region = parsed.region
     explicit_book_count = len(book_uuids)
     if region in ("jp", "auto") and book_uuids:
         book_uuids = [normalize_jp_book_uuid(u) for u in book_uuids]
+        seen_uuids: set[str] = set()
+        deduped: list[str] = []
+        for uid in book_uuids:
+            if uid in seen_uuids:
+                continue
+            seen_uuids.add(uid)
+            deduped.append(uid)
+        if len(deduped) < len(book_uuids):
+            step(f"Skipped {len(book_uuids) - len(deduped)} duplicate UUID(s) in queue")
+        book_uuids = deduped
 
     if book_uuids:
         headline(f"Queue: {len(book_uuids)} book(s)")
@@ -110,8 +164,27 @@ def main():
         cache_path.mkdir()
         print(f"Cache directory cleared at {cache_path}")
 
-    driver = cfg.get_webdriver()
     cfg.config_logging()
+    headless = cfg.effective_headless()
+    if cfg.headless and cfg.chrome_user_data_dir and not headless:
+        step(
+            "Chrome: visible window (headless ignored — saved profile needs a real window)"
+        )
+    elif headless:
+        step(
+            f"Chrome: headless"
+            + (f" (profile {cfg.chrome_user_data_dir})" if cfg.chrome_user_data_dir else "")
+        )
+    else:
+        step(
+            "Chrome: visible window"
+            + (f" (profile {cfg.chrome_user_data_dir})" if cfg.chrome_user_data_dir else "")
+        )
+    try:
+        driver = cfg.get_webdriver()
+    except RuntimeError as chrome_err:
+        warn(str(chrome_err))
+        return 1
 
     try:
         username = '' if cfg.manual_login else (
@@ -209,6 +282,9 @@ def main():
                         f"Timed out on {book_uuid} ({timeout_err}); "
                         "continuing with next book"
                     )
+                except JpDownloadIncomplete as incomplete:
+                    books_failed.append((book_uuid, str(incomplete)))
+                    warn(str(incomplete))
                 except Exception as book_error:
                     if _browser_dead(book_error):
                         logging.error(

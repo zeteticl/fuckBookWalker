@@ -24,7 +24,21 @@ from contextlib import suppress
 from PIL import Image
 from base64 import b64decode
 from collections import deque
-from .exc import RequiresCapcha
+from .download_manifest import (
+    BookManifest,
+    all_spreads_verified_on_disk,
+    collect_suspect_spreads,
+    find_verified_spread_with_hash,
+    load_manifest,
+    mark_spread_failed,
+    mark_spread_verified,
+    reconcile_manifest_hashes_from_disk,
+    save_manifest,
+    sha256_bytes,
+    spread_resume_skippable,
+    spread_verified_on_disk,
+)
+from .exc import JpDownloadIncomplete, RequiresCapcha
 from .commonvars import cookies_path
 from .utils import find_click, save_cookies, recover_cookies, scroll_click
 from .user_log import book_header, done, step, warn
@@ -348,15 +362,17 @@ def _loading_overlay_visible(driver: webdriver.Chrome) -> bool:
     )
 
 
-def wait4loading(driver: webdriver.Chrome, timeout: int = 60):
+def wait4loading(driver: webdriver.Chrome, timeout: int = 60) -> bool:
     try:
         WebDriverWait(driver, timeout).until(
             lambda d: not _loading_overlay_visible(d)
         )
+        return True
     except TimeoutException:
         logging.warning(
-            "Loading overlay did not clear within %ss; continuing anyway", timeout
+            "Loading overlay did not clear within %ss", timeout
         )
+        return False
 
 
 _NFBR_MENU_KEY_JS = (
@@ -411,6 +427,70 @@ def get_current_spread(driver: webdriver.Chrome):
         f"return {get_menu(driver)}.model.attributes.viewera6e.getSpreadIndex()")
 
 
+def get_spread_page_index(driver: webdriver.Chrome, spread: int) -> int:
+    return driver.execute_script(
+        f"return {get_menu(driver)}.model.attributes.a2u.r8q[{spread - 1}].pageIndex"
+    )
+
+
+_READ_PAGE_SLIDER_JS = """
+const el = document.querySelector("#pageSliderCounter");
+if (!el) return null;
+const m = (el.textContent || "").trim().match(/^(\\d+)\\s*\\/\\s*(\\d+)$/);
+if (!m) return null;
+return { current: parseInt(m[1], 10), total: parseInt(m[2], 10) };
+"""
+
+
+def get_page_slider_counter(driver: webdriver.Chrome) -> tuple[int, int] | None:
+    _viewer_default_content(driver)
+    for _ in _each_browsing_context(driver):
+        with suppress(JavascriptException, WebDriverException):
+            raw = driver.execute_script(_READ_PAGE_SLIDER_JS)
+            if raw and raw.get("current") and raw.get("total"):
+                return int(raw["current"]), int(raw["total"])
+    _viewer_default_content(driver)
+    return None
+
+
+def expected_book_page_for_spread(driver: webdriver.Chrome, spread: int) -> int:
+    return get_spread_page_index(driver, spread) + 1
+
+
+def viewer_position_matches_spread(driver: webdriver.Chrome, spread: int) -> bool:
+    """Confirm spread index and book page (pageSliderCounter when available)."""
+    with suppress(JavascriptException):
+        _ensure_nfbr_context(driver)
+        if get_current_spread(driver) != spread:
+            return False
+        expected_page = expected_book_page_for_spread(driver, spread)
+        slider = get_page_slider_counter(driver)
+        if slider is not None:
+            current, _total = slider
+            if current == expected_page:
+                return True
+            # 見開き: slider may show either page of the spread.
+            if current in (expected_page, expected_page + 1):
+                return True
+            logging.debug(
+                "pageSlider %s/%s for spread %s (expected book page %s)",
+                slider[0],
+                slider[1],
+                spread,
+                expected_page,
+            )
+            return False
+        actual_pi = driver.execute_script(
+            f"return {get_menu(driver)}.model.attributes.viewera6e.getPageIndex()"
+        )
+        return actual_pi == get_spread_page_index(driver, spread)
+    return False
+
+
+def viewer_at_spread(driver: webdriver.Chrome, spread: int) -> bool:
+    return viewer_position_matches_spread(driver, spread)
+
+
 def go2page(driver: webdriver.Chrome, page: int):
     driver.execute_script(f"{get_menu(driver)}.options.a6l.moveToPage({page-1});")
 
@@ -419,6 +499,80 @@ def go2spread(driver: webdriver.Chrome, spread: int):
     page_index = driver.execute_script(
         f"return {get_menu(driver)}.model.attributes.a2u.r8q[{spread-1}].pageIndex")
     go2page(driver, page_index+1)
+
+
+_FORCE_SPREAD_VIEW_JS = """
+const menu = __MENU__;
+function collectSpreadSetters(root, depth, out) {
+  if (!root || depth > 4) return;
+  let names;
+  try {
+    names = Object.getOwnPropertyNames(root);
+  } catch (e) {
+    return;
+  }
+  for (const name of names) {
+    if (!/spread|見開|pageview|pagelayout|facing/i.test(name)) continue;
+    let value;
+    try {
+      value = root[name];
+    } catch (e) {
+      continue;
+    }
+    if (typeof value === "function") {
+      for (const arg of [1, 2, true]) {
+        out.push(() => value.call(root, arg));
+      }
+    } else if (typeof value === "number") {
+      out.push(() => {
+        root[name] = 1;
+      });
+      out.push(() => {
+        root[name] = 2;
+      });
+    } else if (typeof value === "boolean") {
+      out.push(() => {
+        root[name] = true;
+      });
+    }
+  }
+  for (const name of names) {
+    try {
+      const child = root[name];
+      if (child && typeof child === "object") {
+        collectSpreadSetters(child, depth + 1, out);
+      }
+    } catch (e) {}
+  }
+}
+const targets = [];
+const roots = [
+  menu.options,
+  menu.options && menu.options.a6l,
+  menu.model && menu.model.attributes,
+  menu.model && menu.model.attributes && menu.model.attributes.viewera6e,
+  menu.model && menu.model.attributes && menu.model.attributes.a2u,
+];
+for (const root of roots) collectSpreadSetters(root, 0, targets);
+for (const run of targets) {
+  try {
+    run();
+    return true;
+  } catch (e) {}
+}
+return false;
+"""
+
+
+def force_spread_view(driver: webdriver.Chrome) -> bool:
+    """Try to switch BookWalker reader to 見開き (face spread) display."""
+    if not _ensure_nfbr_context(driver):
+        return False
+    menu = get_menu(driver)
+    script = _FORCE_SPREAD_VIEW_JS.replace("__MENU__", menu)
+    with suppress(JavascriptException, WebDriverException):
+        return bool(driver.execute_script(script))
+    return False
 
 
 _VIEWER_CID_URLS = (
@@ -568,6 +722,156 @@ def _find_read_button(driver: webdriver.Chrome, book_uuid: str, timeout: int = 1
 
 
 _VIEWER_CANVAS_SELECTOR = ".currentScreen canvas"
+
+# Composite every visible spread canvas (BookWalker uses 2 canvases for 2-page spreads).
+_CAPTURE_SPREAD_JS = """
+function visibleCanvases(root) {
+  return Array.from(root.querySelectorAll("canvas")).filter((c) => {
+    if (c.width < 2 || c.height < 2) return false;
+    const r = c.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(c);
+    return s.display !== "none" && s.visibility !== "hidden" && Number(s.opacity) > 0.01;
+  });
+}
+
+function collectCanvases() {
+  const current = document.querySelector(".currentScreen");
+  if (!current) return [];
+  return visibleCanvases(current);
+}
+
+function dedupeStackedCanvases(canvases) {
+  const out = [];
+  for (const c of canvases) {
+    const r = c.getBoundingClientRect();
+    const idx = out.findIndex(
+      (d) => Math.abs(d.getBoundingClientRect().left - r.left) < 3
+        && Math.abs(d.getBoundingClientRect().top - r.top) < 3
+    );
+    if (idx >= 0) out[idx] = c;
+    else out.push(c);
+  }
+  return out;
+}
+
+function captureSpread() {
+  let canvases = dedupeStackedCanvases(collectCanvases());
+  if (!canvases.length) return null;
+  canvases.sort(
+    (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left
+  );
+  if (canvases.length === 1) {
+    return canvases[0].toDataURL("image/png");
+  }
+  const out = document.createElement("canvas");
+  out.width = canvases.reduce((sum, c) => sum + c.width, 0);
+  out.height = Math.max(...canvases.map((c) => c.height));
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, out.width, out.height);
+  let x = 0;
+  for (const c of canvases) {
+    ctx.drawImage(c, x, 0);
+    x += c.width;
+  }
+  return out.toDataURL("image/png");
+}
+
+return captureSpread();
+"""
+
+_CANVAS_DIGEST_JS = """
+function visibleCanvases(root) {
+  return Array.from(root.querySelectorAll("canvas")).filter((c) => {
+    if (c.width < 2 || c.height < 2) return false;
+    const r = c.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(c);
+    return s.display !== "none" && s.visibility !== "hidden" && Number(s.opacity) > 0.01;
+  });
+}
+
+function digestSpreadCanvases() {
+  const current = document.querySelector(".currentScreen");
+  if (!current) return null;
+  const canvases = visibleCanvases(current);
+  if (!canvases.length) return null;
+  canvases.sort(
+    (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left
+  );
+  let acc = String(canvases.length);
+  for (const c of canvases) {
+    const ctx = c.getContext("2d");
+    const w = c.width;
+    const h = c.height;
+    const sw = Math.min(48, w);
+    const sh = Math.min(48, h);
+    const data = ctx.getImageData(0, 0, sw, sh).data;
+    let s = 0;
+    for (let i = 0; i < data.length; i += 16) {
+      s = (s + data[i] + data[i + 1] + data[i + 2]) | 0;
+    }
+    acc += "|" + w + "x" + h + ":" + s;
+  }
+  return acc;
+}
+
+return digestSpreadCanvases();
+"""
+
+
+def _data_url_to_png_bytes(data_url: str) -> bytes:
+    payload = data_url.split(",", 1)[-1]
+    return b64decode(payload)
+
+
+def _spread_canvas_digest(driver: webdriver.Chrome) -> str | None:
+    _viewer_default_content(driver)
+    for _ in _each_browsing_context(driver):
+        with suppress(JavascriptException, WebDriverException):
+            digest = driver.execute_script(_CANVAS_DIGEST_JS)
+            if digest:
+                return str(digest)
+    _viewer_default_content(driver)
+    return None
+
+
+def _image_is_all_black(img: Image.Image) -> bool:
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    if w == 0 or h == 0:
+        return True
+    step_x = max(1, w // 24)
+    step_y = max(1, h // 24)
+    for y in range(0, h, step_y):
+        for x in range(0, w, step_x):
+            if any(rgb.getpixel((x, y))):
+                return False
+    return True
+
+
+def _spread_image_looks_half_blank(img: Image.Image) -> bool:
+    w, h = img.size
+    if w < int(h * 1.15):
+        return False
+    left = img.crop((0, 0, w // 2, h)).convert("L")
+    pixels = left.getdata()
+    if not pixels:
+        return False
+    near_white = sum(1 for p in pixels if p > 248)
+    return near_white / len(pixels) > 0.9
+
+
+def _capture_spread_png_bytes(driver: webdriver.Chrome) -> bytes | None:
+    _viewer_default_content(driver)
+    for _ in _each_browsing_context(driver):
+        with suppress(JavascriptException, WebDriverException):
+            data_url = driver.execute_script(_CAPTURE_SPREAD_JS)
+            if data_url:
+                return _data_url_to_png_bytes(data_url)
+    _viewer_default_content(driver)
+    return None
 
 
 def _viewer_default_content(driver: webdriver.Chrome) -> None:
@@ -761,17 +1065,92 @@ def open_jp_viewer(driver: webdriver.Chrome, cfg: Config, book_uuid: str) -> Non
     raise TimeoutException(f"Could not open viewer after {max_attempts} attempts")
 
 
-def wait_for_spread(
+def wait_for_spread_ready(
     driver: webdriver.Chrome, spread: int, timeout: float
 ) -> bool:
     _ensure_nfbr_context(driver)
     deadline = time.time() + timeout
+    stable_hits = 0
     while time.time() < deadline:
         with suppress(JavascriptException):
-            if get_current_spread(driver) == spread:
-                return True
+            if get_current_spread(driver) == spread and viewer_at_spread(
+                driver, spread
+            ):
+                stable_hits += 1
+                if stable_hits >= 2:
+                    return True
+            else:
+                stable_hits = 0
         sleep(0.15)
     return False
+
+
+def wait_for_canvas_digest_stable(
+    driver: webdriver.Chrome, timeout: float
+) -> bool:
+    deadline = time.time() + timeout
+    last: str | None = None
+    stable_hits = 0
+    while time.time() < deadline:
+        digest = _spread_canvas_digest(driver)
+        if digest is None:
+            stable_hits = 0
+            sleep(0.12)
+            continue
+        if digest == last:
+            stable_hits += 1
+            if stable_hits >= 2:
+                return True
+        else:
+            last = digest
+            stable_hits = 1
+        sleep(0.12)
+    return last is not None
+
+
+def wait_for_spread_canvas_ready(
+    driver: webdriver.Chrome,
+    spread: int,
+    previous_digest: str | None,
+    nav_from_spread: int | None,
+    timeout: float,
+) -> bool:
+    """Wait until spread/page position is correct and canvas is stable."""
+    deadline = time.time() + timeout
+    relax_digest_at = time.time() + min(10.0, timeout * 0.45)
+    need_new_digest = (
+        nav_from_spread is not None
+        and nav_from_spread != spread
+        and previous_digest is not None
+    )
+    while time.time() < deadline:
+        if not viewer_position_matches_spread(driver, spread):
+            sleep(0.15)
+            continue
+        digest = _spread_canvas_digest(driver)
+        if digest is None:
+            sleep(0.15)
+            continue
+        if (
+            need_new_digest
+            and time.time() < relax_digest_at
+            and digest == previous_digest
+        ):
+            sleep(0.2)
+            continue
+        sleep(0.22)
+        again = _spread_canvas_digest(driver)
+        if again == digest and viewer_position_matches_spread(driver, spread):
+            return True
+        sleep(0.1)
+    return False
+
+
+def _try_current_spread(driver: webdriver.Chrome) -> int | None:
+    with suppress(JavascriptException):
+        _ensure_nfbr_context(driver)
+        return get_current_spread(driver)
+    return None
 
 
 def _product_uuid_from_page(driver: webdriver.Chrome) -> str | None:
@@ -809,6 +1188,116 @@ def _reset_tabs_for_next_book(driver: webdriver.Chrome, book_uuid: str) -> None:
     url = driver.current_url or ""
     if _handle_has_viewer_canvas(driver) or "viewer." in url:
         webstore_ready(driver, jp_cooperation_r(book_uuid), timeout=30)
+
+
+def _seed_prev_imgs_for_spread(
+    save_dir: Path,
+    manifest: BookManifest,
+    spread: int,
+    prev_imgs: deque[bytes],
+) -> None:
+    prev_imgs.clear()
+    for s in range(spread - 1, max(0, spread - 3), -1):
+        rec = manifest.spreads.get(s)
+        path = save_dir / f"page_{s}.png"
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        if rec and rec.sha256 and sha256_bytes(data) != rec.sha256:
+            continue
+        prev_imgs.append(data)
+
+
+def _previous_spread_png_bytes(
+    save_dir: Path, manifest: BookManifest, spread: int
+) -> bytes | None:
+    if spread <= 1:
+        return None
+    prev = spread - 1
+    path = save_dir / f"page_{prev}.png"
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    rec = manifest.spreads.get(prev)
+    if rec and rec.sha256 and sha256_bytes(data) != rec.sha256:
+        return None
+    return data
+
+
+def _sync_book_manifest(
+    save_dir: Path,
+    book_uuid: str,
+    total_spreads: int,
+    jp_force_spread_view: bool,
+    overwrite: bool,
+) -> BookManifest:
+    existing = load_manifest(save_dir)
+    if existing is None:
+        return BookManifest(
+            book_uuid=book_uuid,
+            total_spreads=total_spreads,
+            jp_force_spread_view=jp_force_spread_view,
+        )
+    if (
+        existing.book_uuid != book_uuid
+        or existing.total_spreads != total_spreads
+        or existing.jp_force_spread_view != jp_force_spread_view
+    ):
+        warn(
+            "Manifest mismatch (book id, spread count, or 見開き) — "
+            "spread verification records were reset"
+        )
+        return BookManifest(
+            book_uuid=book_uuid,
+            total_spreads=total_spreads,
+            jp_force_spread_view=jp_force_spread_view,
+        )
+    if overwrite:
+        return BookManifest(
+            book_uuid=book_uuid,
+            total_spreads=total_spreads,
+            jp_force_spread_view=jp_force_spread_view,
+        )
+    existing.total_spreads = total_spreads
+    existing.jp_force_spread_view = jp_force_spread_view
+    return existing
+
+
+def _finish_download_or_raise(
+    title: str,
+    save_dir: Path,
+    manifest: BookManifest,
+    total_spreads: int,
+) -> None:
+    reconcile_manifest_hashes_from_disk(manifest, save_dir)
+    save_manifest(save_dir, manifest)
+    verified = sum(
+        1
+        for s in range(1, total_spreads + 1)
+        if spread_verified_on_disk(manifest, s, save_dir)
+    )
+    suspects = collect_suspect_spreads(manifest)
+    failed = [
+        s
+        for s in range(1, total_spreads + 1)
+        if not spread_verified_on_disk(manifest, s, save_dir)
+    ]
+    if verified == total_spreads and not suspects:
+        done(f"Finished — {verified}/{total_spreads} spreads verified in babies/{title}")
+        return
+    if failed:
+        sample = failed[:12]
+        extra = f" (+{len(failed) - len(sample)} more)" if len(failed) > len(sample) else ""
+        warn(f"Incomplete spreads: {sample}{extra}")
+    if suspects:
+        warn(f"Duplicate-hash suspects: {suspects[:8]}")
+    raise JpDownloadIncomplete(
+        title=title,
+        verified=verified,
+        total_spreads=total_spreads,
+        failed_spreads=failed,
+        suspect_pairs=suspects,
+    )
 
 
 def _leave_viewer_after_download(driver: webdriver.Chrome, book_uuid: str) -> None:
@@ -852,6 +1341,33 @@ def download_book(
     if authors:
         step(f"Author(s): {', '.join(authors)}")
 
+    save_dir = Path(f"babies/{title}")
+    save_dir.mkdir(exist_ok=True, parents=True)
+    meta_path = save_dir / "meta.json"
+
+    pre_manifest = load_manifest(save_dir)
+    if pre_manifest and pre_manifest.book_uuid == book_uuid and not overwrite:
+        if reconcile_manifest_hashes_from_disk(pre_manifest, save_dir):
+            save_manifest(save_dir, pre_manifest)
+    if (
+        pre_manifest
+        and pre_manifest.book_uuid == book_uuid
+        and not overwrite
+        and pre_manifest.total_spreads > 0
+        and all_spreads_verified_on_disk(
+            pre_manifest, pre_manifest.total_spreads, save_dir
+        )
+    ):
+        step(
+            f"All {pre_manifest.total_spreads} spreads verified in manifest — "
+            "skipping reader"
+        )
+        done(
+            f"Finished — {pre_manifest.total_spreads}/{pre_manifest.total_spreads} "
+            f"spreads verified in babies/{title}"
+        )
+        return
+
     driver.set_window_size(*cfg.viewer_size)
 
     step("Opening reader…")
@@ -861,20 +1377,19 @@ def download_book(
             f"Viewer did not open for {book_uuid} (url={driver.current_url})"
         )
 
-    save_dir = Path(f"babies/{title}")
-    save_dir.mkdir(exist_ok=True, parents=True)
-    meta_path = save_dir / "meta.json"
-    meta_path.write_text(
-        json.dumps(
-            {"title": title, "authors": authors, "book_uuid": book_uuid},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
     _viewer_default_content(driver)
     wait4loading(driver, timeout=cfg.loading_timeout_seconds)
+
+    if cfg.jp_force_spread_view:
+        if force_spread_view(driver):
+            step("Reader: 見開き (two-page spread) enabled")
+        else:
+            warn(
+                "Could not enable 見開き automatically — in the reader menu set "
+                "Spread Display (見開き) to face spread, then re-download"
+            )
+        wait4loading(driver, timeout=cfg.loading_timeout_seconds)
+        sleep(1)
 
     spreads_deadline = time.time() + max(120, cfg.loading_timeout_seconds * 2)
     while time.time() < spreads_deadline:
@@ -886,100 +1401,329 @@ def download_book(
             sleep(0.5)
     else:
         raise TimeoutException("Total spreads retrieval timeout")
-    step(f"Spreads: {total_spreads}")
-    prev_imgs = deque[bytes](maxlen=2)  # used for checking update for 2 buffers
-    max_retries = 30
-    existing_pages = sum(1 for p in save_dir.glob("page_*.png"))
-    if existing_pages and not overwrite:
+    step(f"Spreads: {total_spreads} (capture unit = spread, not single book page)")
+    meta_path.write_text(
+        json.dumps(
+            {
+                "title": title,
+                "authors": authors,
+                "book_uuid": book_uuid,
+                "total_spreads": total_spreads,
+                "jp_force_spread_view": cfg.jp_force_spread_view,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    manifest = _sync_book_manifest(
+        save_dir, book_uuid, total_spreads, cfg.jp_force_spread_view, overwrite
+    )
+    healed = reconcile_manifest_hashes_from_disk(manifest, save_dir)
+    if healed:
+        save_manifest(save_dir, manifest)
+        step(f"Reconciled {healed} spread hash(es) with on-disk PNGs")
+    verified_before = sum(
+        1
+        for s in range(1, total_spreads + 1)
+        if spread_resume_skippable(manifest, s, save_dir)
+    )
+    if verified_before and not overwrite:
         step(
-            f"Saving {total_spreads} pages to babies/{title} "
-            f"(resume: {existing_pages} already on disk)"
+            f"Saving {total_spreads} spreads to babies/{title} "
+            f"(resume: {verified_before} verified in manifest)"
         )
     else:
-        step(f"Saving {total_spreads} pages to babies/{title}")
+        step(f"Saving {total_spreads} spreads to babies/{title}")
 
-    if (
-        not overwrite
-        and existing_pages >= total_spreads
-        and (save_dir / f"page_{total_spreads}.png").exists()
+    if not overwrite and all_spreads_verified_on_disk(
+        manifest, total_spreads, save_dir
     ):
-        step(f"All {total_spreads} pages on disk — skipping capture")
+        step(f"All {total_spreads} spreads verified — skipping capture")
         _leave_viewer_after_download(driver, book_uuid)
-        done(f"Finished — {total_spreads}/{total_spreads} pages in babies/{title}")
+        done(
+            f"Finished — {total_spreads}/{total_spreads} spreads verified "
+            f"in babies/{title}"
+        )
         return
 
-    go2spread(driver, 1)
-    sleep(2)
+    spreads_to_capture = [
+        s
+        for s in range(1, total_spreads + 1)
+        if overwrite or not spread_resume_skippable(manifest, s, save_dir)
+    ]
+    if spreads_to_capture:
+        first = spreads_to_capture[0]
+        if not viewer_position_matches_spread(driver, first):
+            go2spread(driver, first)
+            sleep(1)
+        else:
+            sleep(0.3)
 
-    bar_label = f"Pages · {title[:40]}"
+    prev_imgs = deque[bytes](maxlen=2)
+    manifest_writes_since_flush = 0
+
+    def _persist_manifest(force: bool = False) -> None:
+        nonlocal manifest_writes_since_flush
+        if force:
+            save_manifest(save_dir, manifest)
+            manifest_writes_since_flush = 0
+            return
+        manifest_writes_since_flush += 1
+        if manifest_writes_since_flush >= 5:
+            save_manifest(save_dir, manifest)
+            manifest_writes_since_flush = 0
+    max_retries = 12
+    bar_label = f"Spreads · {title[:40]}"
     for current_spread in track(
-        range(1, total_spreads + 1), description=bar_label, total=total_spreads
+        spreads_to_capture, description=bar_label, total=len(spreads_to_capture)
     ):
         retry = 0
         savename = save_dir / f"page_{current_spread}.png"
-        if savename.exists() and not overwrite:
-            logging.debug("page %s already exists, skipping", current_spread)
-            continue
-        nav_timeout = max(120.0, cfg.loading_timeout_seconds * 2)
+        nav_timeout = min(90.0, max(45.0, cfg.loading_timeout_seconds * 1.5))
+        page_index: int | None = None
         try:
             _ensure_nfbr_context(driver)
-            go2spread(driver, current_spread)
-            if not wait_for_spread(driver, current_spread, nav_timeout):
+            _seed_prev_imgs_for_spread(save_dir, manifest, current_spread, prev_imgs)
+            nav_from_spread = _try_current_spread(driver)
+            before_digest = _spread_canvas_digest(driver)
+            page_index = get_spread_page_index(driver, current_spread)
+            if not viewer_position_matches_spread(driver, current_spread):
+                go2spread(driver, current_spread)
+            if not wait_for_spread_ready(driver, current_spread, nav_timeout):
                 logging.warning(
                     "Spread %s navigation slow; retrying once", current_spread
                 )
                 go2spread(driver, current_spread)
-                if not wait_for_spread(driver, current_spread, nav_timeout):
-                    logging.error(
-                        "Skipping spread %s after navigation timeout; continuing book",
+                if not wait_for_spread_ready(driver, current_spread, nav_timeout):
+                    mark_spread_failed(
+                        manifest,
                         current_spread,
+                        "navigation timeout",
+                        page_index=page_index,
+                    )
+                    _persist_manifest(force=True)
+                    logging.error(
+                        "Spread %s navigation failed; not saved", current_spread
                     )
                     continue
             cfg.rate_limit_after_action()
-            wait4loading(driver, timeout=cfg.loading_timeout_seconds)
-            logging.debug("Getting page %s out of %s", current_spread, total_spreads)
-            canvas = _find_viewer_canvas(driver)
-            if canvas is None:
-                raise TimeoutException(
-                    f"Viewer canvas not found for spread {current_spread}"
+            if not wait4loading(driver, timeout=cfg.loading_timeout_seconds):
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    "loading overlay timeout",
+                    page_index=page_index,
                 )
-            img = None
-            while retry < max_retries:
-                canvas_base64 = driver.execute_script(
-                    "return arguments[0].toDataURL('image/png').slice(21);", canvas)
-                img_bytes = b64decode(canvas_base64)
-                img = Image.open(io.BytesIO(img_bytes))
-                if all(all(v == 0 for v in c) for c in img.getdata()):
-                    logging.debug(
-                        "Blank page %s, treated as unloaded page", current_spread
-                    )
-                elif img_bytes not in prev_imgs:
-                    prev_imgs.append(img_bytes)
-                    break
-                retry += 1
-                logging.debug(
-                    "Retrying page %s (%s/%s)", current_spread, retry, max_retries
-                )
-                cfg.rate_limit_retry_delay()
-            if retry == max_retries:
-                logging.warning("Potentially repeated page %s", current_spread)
-            if img is None:
+                _persist_manifest(force=True)
                 logging.error(
-                    "No image for spread %s; skipping page", current_spread
+                    "Spread %s loading did not finish; not saved", current_spread
                 )
                 continue
-            img.save(savename)
-            logging.debug("Saved page %s", current_spread)
+            if not viewer_position_matches_spread(driver, current_spread):
+                slider = get_page_slider_counter(driver)
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    "spread/page slider mismatch after navigation"
+                    + (f" (slider={slider})" if slider else ""),
+                    page_index=page_index,
+                )
+                _persist_manifest(force=True)
+                logging.error(
+                    "Spread %s position not confirmed (slider=%s); not saved",
+                    current_spread,
+                    slider,
+                )
+                continue
+            canvas_timeout = min(35.0, max(18.0, float(cfg.loading_timeout_seconds) * 0.6))
+            canvas_ok = wait_for_spread_canvas_ready(
+                driver,
+                current_spread,
+                before_digest,
+                nav_from_spread,
+                canvas_timeout,
+            )
+            if not canvas_ok:
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    "canvas not ready after navigation",
+                    page_index=page_index,
+                )
+                _persist_manifest(force=True)
+                logging.error(
+                    "Spread %s canvas not ready after navigation; not saved",
+                    current_spread,
+                )
+                continue
+
+            img = None
+            img_bytes: bytes | None = None
+            accepted = False
+            while retry < max_retries:
+                if not viewer_position_matches_spread(driver, current_spread):
+                    logging.debug(
+                        "Spread %s position mismatch before capture; re-navigating",
+                        current_spread,
+                    )
+                    go2spread(driver, current_spread)
+                    sleep(0.4)
+                    retry += 1
+                    cfg.rate_limit_retry_delay()
+                    continue
+                raw = _capture_spread_png_bytes(driver)
+                if raw is None:
+                    logging.debug(
+                        "No spread capture for spread %s, retrying", current_spread
+                    )
+                    retry += 1
+                    cfg.rate_limit_retry_delay()
+                    continue
+                img_bytes = raw
+                img = Image.open(io.BytesIO(img_bytes))
+                if _image_is_all_black(img):
+                    logging.debug(
+                        "Blank spread %s, treated as unloaded", current_spread
+                    )
+                elif _spread_image_looks_half_blank(img):
+                    logging.debug(
+                        "Spread %s looks half-blank (missing left page), retrying",
+                        current_spread,
+                    )
+                elif img_bytes in prev_imgs:
+                    logging.debug(
+                        "Spread %s frame unchanged (buffer duplicate), re-navigating",
+                        current_spread,
+                    )
+                    go2spread(driver, current_spread)
+                    sleep(0.5)
+                    wait_for_spread_canvas_ready(
+                        driver,
+                        current_spread,
+                        None,
+                        nav_from_spread,
+                        min(15.0, canvas_timeout),
+                    )
+                else:
+                    digest = sha256_bytes(img_bytes)
+                    other = find_verified_spread_with_hash(
+                        manifest, current_spread, digest
+                    )
+                    if other is not None:
+                        logging.debug(
+                            "Spread %s matches verified spread %s; retrying",
+                            current_spread,
+                            other,
+                        )
+                    else:
+                        prev_bytes = _previous_spread_png_bytes(
+                            save_dir, manifest, current_spread
+                        )
+                        if prev_bytes is not None and img_bytes == prev_bytes:
+                            logging.debug(
+                                "Spread %s matches previous spread file; retrying",
+                                current_spread,
+                            )
+                        else:
+                            prev_imgs.append(img_bytes)
+                            accepted = True
+                            break
+                retry += 1
+                logging.debug(
+                    "Retrying spread %s (%s/%s)", current_spread, retry, max_retries
+                )
+                cfg.rate_limit_retry_delay()
+
+            if not accepted or img is None or img_bytes is None:
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    "capture validation exhausted",
+                    page_index=page_index,
+                )
+                _persist_manifest(force=True)
+                logging.error(
+                    "Spread %s not verified; not saved", current_spread
+                )
+                continue
+
+            if not viewer_position_matches_spread(driver, current_spread):
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    "spread index changed after capture",
+                    page_index=page_index,
+                )
+                _persist_manifest(force=True)
+                logging.error(
+                    "Spread %s moved after capture; not saved", current_spread
+                )
+                continue
+
+            digest = sha256_bytes(img_bytes)
+            other = find_verified_spread_with_hash(
+                manifest, current_spread, digest
+            )
+            if other is not None:
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    f"duplicate hash of spread {other}",
+                    page_index=page_index,
+                )
+                _persist_manifest(force=True)
+                logging.error(
+                    "Spread %s duplicate of spread %s; not saved",
+                    current_spread,
+                    other,
+                )
+                continue
+
+            savename.write_bytes(img_bytes)
+            dup = mark_spread_verified(
+                manifest,
+                current_spread,
+                img_bytes,
+                img.width,
+                img.height,
+                page_index if page_index is not None else 0,
+            )
+            if dup is not None:
+                with suppress(OSError):
+                    savename.unlink(missing_ok=True)
+                mark_spread_failed(
+                    manifest,
+                    current_spread,
+                    f"duplicate hash of spread {dup}",
+                    page_index=page_index,
+                )
+                _persist_manifest(force=True)
+                logging.error(
+                    "Spread %s duplicate of spread %s; removed file",
+                    current_spread,
+                    dup,
+                )
+                continue
+            _persist_manifest()
+            logging.debug("Saved verified spread %s", current_spread)
             _viewer_default_content(driver)
         except Exception as page_error:
+            mark_spread_failed(
+                manifest,
+                current_spread,
+                f"exception: {page_error}",
+                page_index=page_index,
+            )
+            _persist_manifest(force=True)
             logging.error(
-                "Failed spread %s (%s); continuing download",
+                "Failed spread %s (%s); not saved",
                 current_spread,
                 page_error,
             )
             continue
         cfg.rate_limit_after_page(current_spread)
 
+    _persist_manifest(force=True)
     _leave_viewer_after_download(driver, book_uuid)
-    saved = sum(1 for p in save_dir.glob("page_*.png"))
-    done(f"Finished — {saved}/{total_spreads} pages in babies/{title}")
+    _finish_download_or_raise(title, save_dir, manifest, total_spreads)

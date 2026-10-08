@@ -150,3 +150,5 @@ dmypy.json
 /debug
 *.txt
 /scripts
+/babies-source
+/babies-translated
